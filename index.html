@@ -1,0 +1,479 @@
+#!/usr/bin/env bash
+#
+# expand - Ubuntu LVM Filesystem Expansion Tool
+# https://github.com/SolubleSpork/expand
+#
+# Usage: curl -sL solublespork.github.io/expand | sudo bash
+#
+
+set -euo pipefail
+
+VERSION="1.0.0"
+DRY_RUN=false
+AUTO_MODE=false
+DEMO_MODE=false
+DEMO_SCENARIO=1
+
+# Colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+DIM='\033[2m'
+BOLD='\033[1m'
+NC='\033[0m'
+
+# Global array to store scan results
+declare -a EXPANDABLE_ITEMS=()
+
+print_success() { echo -e "${GREEN}✓${NC} $1"; }
+print_error() { echo -e "${RED}✗${NC} $1"; }
+print_warning() { echo -e "${YELLOW}!${NC} $1"; }
+
+confirm() {
+    local response
+    echo -en "${YELLOW}?${NC} $1 [y/N] "
+    read -r response
+    [[ "$response" =~ ^[Yy]$ ]]
+}
+
+run_cmd() {
+    local cmd="$1"
+    if $DRY_RUN; then
+        echo -e "    ${DIM}[dry-run]${NC} $cmd"
+    else
+        echo -e "    ${DIM}Running:${NC} $cmd"
+        eval "$cmd"
+    fi
+}
+
+check_root() {
+    if [[ $EUID -ne 0 ]]; then
+        print_error "This script must be run as root (use sudo)"
+        exit 1
+    fi
+}
+
+check_lvm() {
+    if ! command -v pvs &> /dev/null; then
+        print_error "LVM tools not found. Install with: apt install lvm2"
+        exit 1
+    fi
+}
+
+# Convert size string to bytes for comparison
+size_to_bytes() {
+    local size="$1"
+    local num unit
+    num=$(echo "$size" | sed 's/[^0-9.]//g')
+    unit=$(echo "$size" | sed 's/[0-9.<]//g' | tr '[:lower:]' '[:upper:]')
+
+    case "$unit" in
+        T|TB|TIB) echo "$num * 1024 * 1024 * 1024 * 1024" | bc 2>/dev/null || echo 0 ;;
+        G|GB|GIB) echo "$num * 1024 * 1024 * 1024" | bc 2>/dev/null || echo 0 ;;
+        M|MB|MIB) echo "$num * 1024 * 1024" | bc 2>/dev/null || echo 0 ;;
+        K|KB|KIB) echo "$num * 1024" | bc 2>/dev/null || echo 0 ;;
+        *) echo "$num" ;;
+    esac
+}
+
+# Demo mode - simulate common scenarios for testing UI
+load_demo_data() {
+    local scenario="${1:-1}"
+
+    case "$scenario" in
+        1)
+            # Single root volume - typical Ubuntu VM expanded from 50G to 100G
+            # format: lv_path|vg_name|mountpoint|fstype|current_fs_size|potential_size|used|used_pct
+            EXPANDABLE_ITEMS=(
+                "/dev/mapper/ubuntu--vg-ubuntu--lv|ubuntu-vg|/|ext4|48G|100G|16G|33%"
+            )
+            ;;
+        2)
+            # Multiple volumes - mixed workload server
+            EXPANDABLE_ITEMS=(
+                "/dev/mapper/ubuntu--vg-ubuntu--lv|ubuntu-vg|/|ext4|48G|100G|16G|33%"
+                "/dev/mapper/data--vg-data--lv|data-vg|/data|xfs|100G|500G|89G|89%"
+                "/dev/mapper/logs--vg-logs--lv|logs-vg|/var/log|ext4|10G|15G|8G|80%"
+            )
+            ;;
+        3)
+            # No expansion available (PV needs resize first)
+            EXPANDABLE_ITEMS=()
+            ;;
+    esac
+
+    [[ ${#EXPANDABLE_ITEMS[@]} -gt 0 ]]
+}
+
+# Main scanning function - finds all expansion opportunities
+scan_system() {
+    # Demo mode - use fake data
+    if $DEMO_MODE; then
+        load_demo_data "${DEMO_SCENARIO:-1}"
+        return $?
+    fi
+
+    EXPANDABLE_ITEMS=()
+
+    local found_any=false
+
+    # Get VG info (free space and total size)
+    declare -A vg_free
+    declare -A vg_size
+    while read -r vg_name free_space total_size; do
+        vg_name=$(echo "$vg_name" | xargs)
+        free_space=$(echo "$free_space" | xargs)
+        total_size=$(echo "$total_size" | xargs)
+        if [[ -n "$vg_name" ]]; then
+            vg_free["$vg_name"]="$free_space"
+            vg_size["$vg_name"]="$total_size"
+        fi
+    done < <(vgs --noheadings -o vg_name,vg_free,vg_size --units g 2>/dev/null)
+
+    # Scan each LV
+    while read -r lv_line; do
+        [[ -z "$lv_line" ]] && continue
+
+        local lv_path lv_size vg_name
+        lv_path=$(echo "$lv_line" | awk '{print $1}' | xargs)
+        lv_size=$(echo "$lv_line" | awk '{print $2}' | xargs)
+        vg_name=$(echo "$lv_line" | awk '{print $3}' | xargs)
+
+        [[ -z "$lv_path" ]] && continue
+
+        local mountpoint fstype fs_size fs_used fs_pct
+        mountpoint=$(findmnt -n -o TARGET "$lv_path" 2>/dev/null || echo "")
+        fstype=$(blkid -o value -s TYPE "$lv_path" 2>/dev/null || echo "unknown")
+
+        # Get filesystem usage if mounted
+        if [[ -n "$mountpoint" ]]; then
+            read -r fs_size fs_used fs_pct < <(df -h "$mountpoint" 2>/dev/null | tail -1 | awk '{print $2, $3, $5}')
+        else
+            fs_size="$lv_size"
+            fs_used="-"
+            fs_pct="-"
+        fi
+
+        # Check if VG has free space
+        local free="${vg_free[$vg_name]:-0}"
+        local free_bytes
+        free_bytes=$(size_to_bytes "$free")
+
+        # Only show if there's meaningful free space (> 100MB)
+        if (( $(echo "$free_bytes > 104857600" | bc 2>/dev/null || echo 0) )); then
+            found_any=true
+
+            # Calculate potential size (current + free)
+            local current_num free_num potential_size
+            current_num=$(echo "$fs_size" | sed 's/[^0-9.]//g')
+            free_num=$(echo "$free" | sed 's/[^0-9.]//g')
+            potential_size=$(echo "$current_num + $free_num" | bc 2>/dev/null || echo "?")
+
+            # format: lv_path|vg_name|mountpoint|fstype|current_fs_size|potential_size|used|used_pct
+            EXPANDABLE_ITEMS+=("$lv_path|$vg_name|$mountpoint|$fstype|$fs_size|${potential_size}G|$fs_used|$fs_pct")
+        fi
+    done < <(lvs --noheadings -o lv_path,lv_size,vg_name --units g 2>/dev/null)
+
+    $found_any
+}
+
+show_scan_results() {
+    local count=${#EXPANDABLE_ITEMS[@]}
+
+    if [[ $count -eq 0 ]]; then
+        echo ""
+        echo -e "${DIM}No expansion opportunities found.${NC}"
+        echo ""
+        echo "If you recently expanded a disk in Proxmox, you may need to:"
+        echo "  1. Resize the partition (growpart or parted)"
+        echo "  2. Resize the PV (pvresize /dev/sdaX)"
+        echo ""
+        echo "Then run this tool again."
+        exit 0
+    fi
+
+    echo ""
+    if [[ $count -eq 1 ]]; then
+        echo -e "${GREEN}Found 1 volume that can be expanded:${NC}"
+    else
+        echo -e "${GREEN}Found $count volumes that can be expanded:${NC}"
+    fi
+    echo ""
+
+    local i=1
+    for item in "${EXPANDABLE_ITEMS[@]}"; do
+        IFS='|' read -r lv_path vg_name mountpoint fstype current_size potential_size used used_pct <<< "$item"
+
+        # Calculate how much can be added
+        local current_num potential_num gain
+        current_num=$(echo "$current_size" | sed 's/[^0-9.]//g')
+        potential_num=$(echo "$potential_size" | sed 's/[^0-9.]//g')
+        gain=$(echo "$potential_num - $current_num" | bc 2>/dev/null || echo "?")
+
+        # Display name: use mountpoint if available, otherwise LV path
+        local display_name="${mountpoint:-$lv_path}"
+
+        echo -e "  ${BOLD}$i)${NC} ${CYAN}$display_name${NC} ${DIM}($fstype)${NC}"
+        echo -e "     ${DIM}$lv_path${NC}"
+        echo -e "     Filesystem: ${BOLD}$current_size${NC} → could be ${GREEN}$potential_size${NC} ${GREEN}(+${gain}G)${NC}"
+        echo -e "     Currently using: $used ($used_pct)"
+        echo ""
+        ((i++))
+    done
+}
+
+show_menu() {
+    local count=${#EXPANDABLE_ITEMS[@]}
+
+    if [[ $count -gt 1 ]]; then
+        echo -e "  ${BOLD}a)${NC} Expand all"
+    fi
+    echo -e "  ${BOLD}q)${NC} Quit"
+    echo ""
+
+    # Build prompt based on count
+    local prompt
+    if [[ $count -eq 1 ]]; then
+        prompt="Select [1/q]: "
+    else
+        prompt="Select [1-$count/a/q]: "
+    fi
+
+    echo -en "$prompt"
+    read -r choice
+
+    case "$choice" in
+        q|Q)
+            echo "Exiting."
+            exit 0
+            ;;
+        a|A)
+            if [[ $count -gt 1 ]]; then
+                expand_all_lvs
+            else
+                print_error "Invalid input"
+            fi
+            ;;
+        [1-9]*)
+            if (( choice >= 1 && choice <= count )); then
+                expand_single_lv "$((choice - 1))"
+            else
+                print_error "Invalid selection"
+            fi
+            ;;
+        *)
+            print_error "Invalid input"
+            ;;
+    esac
+}
+
+expand_single_lv() {
+    local idx="$1"
+    IFS='|' read -r lv_path vg_name mountpoint fstype current_size potential_size used used_pct <<< "${EXPANDABLE_ITEMS[$idx]}"
+
+    local display_name="${mountpoint:-$lv_path}"
+
+    echo ""
+    echo -e "${BOLD}Expanding:${NC} ${CYAN}$display_name${NC}"
+    echo -e "${DIM}$lv_path${NC}"
+    echo ""
+
+    # Get the PV for this VG to include pvresize
+    local pv_device=""
+    if $DEMO_MODE; then
+        pv_device="/dev/sda3"
+    else
+        pv_device=$(pvs --noheadings -o pv_name -S vg_name="$vg_name" 2>/dev/null | head -1 | xargs)
+    fi
+
+    echo "Steps:"
+    [[ -n "$pv_device" ]] && echo -e "  1. ${DIM}pvresize $pv_device${NC}"
+    echo -e "  2. ${DIM}lvextend -l +100%FREE $lv_path${NC}"
+    case "$fstype" in
+        ext4|ext3|ext2)
+            echo -e "  3. ${DIM}resize2fs $lv_path${NC}"
+            ;;
+        xfs)
+            echo -e "  3. ${DIM}xfs_growfs $mountpoint${NC}"
+            ;;
+        btrfs)
+            echo -e "  3. ${DIM}btrfs filesystem resize max $mountpoint${NC}"
+            ;;
+    esac
+    echo ""
+
+    if $DRY_RUN || confirm "Proceed?"; then
+        [[ -n "$pv_device" ]] && run_cmd "pvresize $pv_device"
+        run_cmd "lvextend -l +100%FREE $lv_path"
+
+        case "$fstype" in
+            ext4|ext3|ext2)
+                run_cmd "resize2fs $lv_path"
+                ;;
+            xfs)
+                [[ -n "$mountpoint" ]] && run_cmd "xfs_growfs $mountpoint"
+                ;;
+            btrfs)
+                [[ -n "$mountpoint" ]] && run_cmd "btrfs filesystem resize max $mountpoint"
+                ;;
+        esac
+
+        echo ""
+        if ! $DRY_RUN; then
+            print_success "Expansion complete!"
+            [[ -n "$mountpoint" ]] && df -h "$mountpoint" | tail -1
+        fi
+    fi
+}
+
+expand_all_lvs() {
+    echo ""
+    echo -e "${BOLD}Expanding all volumes...${NC}"
+    echo ""
+
+    if ! $DRY_RUN && ! $AUTO_MODE; then
+        if ! confirm "Expand all ${#EXPANDABLE_ITEMS[@]} volumes?"; then
+            echo "Cancelled."
+            return
+        fi
+    fi
+
+    # First, resize all PVs
+    echo -e "${DIM}Step 1: Resizing physical volumes...${NC}"
+    local pvs_done=()
+    for item in "${EXPANDABLE_ITEMS[@]}"; do
+        IFS='|' read -r lv_path vg_name mountpoint fstype _ _ _ _ <<< "$item"
+
+        local pv_device=""
+        if $DEMO_MODE; then
+            pv_device="/dev/sda3"
+        else
+            pv_device=$(pvs --noheadings -o pv_name -S vg_name="$vg_name" 2>/dev/null | head -1 | xargs)
+        fi
+
+        # Only resize each PV once
+        if [[ -n "$pv_device" && ! " ${pvs_done[*]} " =~ " $pv_device " ]]; then
+            run_cmd "pvresize $pv_device"
+            pvs_done+=("$pv_device")
+        fi
+    done
+    echo ""
+
+    # Then extend all LVs
+    echo -e "${DIM}Step 2: Extending logical volumes...${NC}"
+    for item in "${EXPANDABLE_ITEMS[@]}"; do
+        IFS='|' read -r lv_path vg_name mountpoint fstype _ _ _ _ <<< "$item"
+        run_cmd "lvextend -l +100%FREE $lv_path"
+    done
+    echo ""
+
+    # Finally resize all filesystems
+    echo -e "${DIM}Step 3: Resizing filesystems...${NC}"
+    for item in "${EXPANDABLE_ITEMS[@]}"; do
+        IFS='|' read -r lv_path vg_name mountpoint fstype _ _ _ _ <<< "$item"
+
+        case "$fstype" in
+            ext4|ext3|ext2)
+                run_cmd "resize2fs $lv_path"
+                ;;
+            xfs)
+                [[ -n "$mountpoint" ]] && run_cmd "xfs_growfs $mountpoint"
+                ;;
+            btrfs)
+                [[ -n "$mountpoint" ]] && run_cmd "btrfs filesystem resize max $mountpoint"
+                ;;
+        esac
+    done
+
+    echo ""
+    if $DRY_RUN; then
+        print_success "Dry-run complete. No changes made."
+    else
+        print_success "All expansions complete!"
+        echo ""
+        echo "New sizes:"
+        df -h --type=ext4 --type=xfs --type=btrfs 2>/dev/null | head -5 || df -h | grep -E '^/dev' | head -5
+    fi
+}
+
+show_usage() {
+    cat << EOF
+${BOLD}expand${NC} v${VERSION} - LVM Filesystem Expansion Tool
+
+${BOLD}Usage:${NC}
+  curl -sL solublespork.github.io/expand | sudo bash
+  curl -sL solublespork.github.io/expand | sudo bash -s -- --auto
+  curl -sL solublespork.github.io/expand | sudo bash -s -- --dry-run
+
+${BOLD}Options:${NC}
+  --auto, -a      Expand everything automatically (no prompts)
+  --dry-run, -d   Show what would happen without making changes
+  --help, -h      Show this help
+
+${BOLD}What it does:${NC}
+  1. pvresize  - Expand PV to use full disk (if needed)
+  2. lvextend  - Extend LV to use free VG space
+  3. resize2fs/xfs_growfs/btrfs resize - Grow the filesystem
+
+${BOLD}Demo/Testing (not for production):${NC}
+  --demo          Test UI with simulated data (scenario 1)
+  --demo=1        Single volume: / with 26G available
+  --demo=2        Multiple volumes: /, /data, /var/log
+  --demo=3        No expansion available (need pvresize first)
+EOF
+}
+
+main() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --auto|-a) AUTO_MODE=true; shift ;;
+            --dry-run|-d) DRY_RUN=true; shift ;;
+            --demo) DEMO_MODE=true; DRY_RUN=true; shift ;;
+            --demo=*) DEMO_MODE=true; DRY_RUN=true; DEMO_SCENARIO="${1#*=}"; shift ;;
+            --help|-h) show_usage; exit 0 ;;
+            --version|-v) echo "expand v$VERSION"; exit 0 ;;
+            *) print_error "Unknown option: $1"; exit 1 ;;
+        esac
+    done
+
+    echo ""
+    echo -e "${BOLD}expand${NC} ${DIM}v${VERSION}${NC}"
+
+    if $DEMO_MODE; then
+        echo -e "${YELLOW}(demo mode - scenario $DEMO_SCENARIO)${NC}"
+    elif $DRY_RUN; then
+        echo -e "${YELLOW}(dry-run mode)${NC}"
+    fi
+
+    # Skip root/lvm checks in demo mode
+    if ! $DEMO_MODE; then
+        check_root
+        check_lvm
+    fi
+
+    echo -en "\nScanning... "
+    if scan_system; then
+        echo "done."
+        show_scan_results
+
+        if $AUTO_MODE; then
+            expand_all_lvs
+        else
+            show_menu
+        fi
+    else
+        echo "done."
+        echo ""
+        echo -e "${DIM}No expansion opportunities found.${NC}"
+        echo ""
+        echo "If you recently expanded a disk in Proxmox:"
+        echo "  1. The partition may need resizing first: growpart /dev/sda 3"
+        echo "  2. Then resize the PV: pvresize /dev/sda3"
+        echo "  3. Run this tool again"
+        echo ""
+    fi
+}
+
+main "$@"
