@@ -8,6 +8,8 @@ Expand LVM filesystems on Ubuntu VMs after increasing disk size in Proxmox.
 curl -sL solublespork.github.io/expand | sudo bash
 ```
 
+> **Note:** The `-L` flag is required (follows redirects). The `-s` is optional (hides progress bar).
+
 The tool scans your system, shows what can be expanded, and lets you choose.
 
 ## Options

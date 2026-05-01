@@ -33,9 +33,9 @@ print_warning() { echo -e "${YELLOW}!${NC} $1"; }
 
 confirm() {
     local response
-    echo -en "${YELLOW}?${NC} $1 [y/N] "
+    echo -en "${YELLOW}?${NC} $1 [Y/n] "
     read -r response < /dev/tty
-    [[ "$response" =~ ^[Yy]$ ]]
+    [[ ! "$response" =~ ^[Nn]$ ]]
 }
 
 run_cmd() {
