@@ -34,7 +34,7 @@ print_warning() { echo -e "${YELLOW}!${NC} $1"; }
 confirm() {
     local response
     echo -en "${YELLOW}?${NC} $1 [y/N] "
-    read -r response
+    read -r response < /dev/tty
     [[ "$response" =~ ^[Yy]$ ]]
 }
 
@@ -242,7 +242,7 @@ show_menu() {
     fi
 
     echo -en "$prompt"
-    read -r choice
+    read -r choice < /dev/tty
 
     case "$choice" in
         q|Q)
