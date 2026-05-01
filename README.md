@@ -12,11 +12,11 @@ curl -sL solublespork.github.io/expand | sudo bash
 
 The tool scans your system, shows what can be expanded, and lets you choose.
 
-## Options
+## Auto Mode
 
-For fully automatic expansion (no prompts):
+To skip prompts and expand everything automatically:
 ```bash
-curl -sL solublespork.github.io/expand | sudo bash -s -- --auto
+curl -sL solublespork.github.io/expand | sudo bash -s auto
 ```
 
 ## What It Does

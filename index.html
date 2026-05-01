@@ -404,35 +404,29 @@ ${BOLD}expand${NC} v${VERSION} - LVM Filesystem Expansion Tool
 
 ${BOLD}Usage:${NC}
   curl -sL solublespork.github.io/expand | sudo bash
-  curl -sL solublespork.github.io/expand | sudo bash -s -- --auto
-  curl -sL solublespork.github.io/expand | sudo bash -s -- --dry-run
+  curl -sL solublespork.github.io/expand | sudo bash -s auto
+  curl -sL solublespork.github.io/expand | sudo bash -s dry-run
 
 ${BOLD}Options:${NC}
-  --auto, -a      Expand everything automatically (no prompts)
-  --dry-run, -d   Show what would happen without making changes
-  --help, -h      Show this help
+  auto       Expand everything automatically (no prompts)
+  dry-run    Show what would happen without making changes
+  help       Show this help
 
 ${BOLD}What it does:${NC}
   1. pvresize  - Expand PV to use full disk (if needed)
   2. lvextend  - Extend LV to use free VG space
   3. resize2fs/xfs_growfs/btrfs resize - Grow the filesystem
-
-${BOLD}Demo/Testing (not for production):${NC}
-  --demo          Test UI with simulated data (scenario 1)
-  --demo=1        Single volume: / with 26G available
-  --demo=2        Multiple volumes: /, /data, /var/log
-  --demo=3        No expansion available (need pvresize first)
 EOF
 }
 
 main() {
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            --auto|-a) AUTO_MODE=true; shift ;;
-            --dry-run|-d) DRY_RUN=true; shift ;;
+            auto|--auto|-a) AUTO_MODE=true; shift ;;
+            dry-run|--dry-run|-d) DRY_RUN=true; shift ;;
             --demo) DEMO_MODE=true; DRY_RUN=true; shift ;;
             --demo=*) DEMO_MODE=true; DRY_RUN=true; DEMO_SCENARIO="${1#*=}"; shift ;;
-            --help|-h) show_usage; exit 0 ;;
+            help|--help|-h) show_usage; exit 0 ;;
             --version|-v) echo "expand v$VERSION"; exit 0 ;;
             *) print_error "Unknown option: $1"; exit 1 ;;
         esac
