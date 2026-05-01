@@ -11,8 +11,6 @@ set -euo pipefail
 VERSION="1.0.0"
 DRY_RUN=false
 AUTO_MODE=false
-DEMO_MODE=false
-DEMO_SCENARIO=1
 
 # Colors
 RED='\033[0;31m'
@@ -78,43 +76,8 @@ size_to_bytes() {
     esac
 }
 
-# Demo mode - simulate common scenarios for testing UI
-load_demo_data() {
-    local scenario="${1:-1}"
-
-    case "$scenario" in
-        1)
-            # Single root volume - typical Ubuntu VM expanded from 50G to 100G
-            # format: lv_path|vg_name|mountpoint|fstype|current_fs_size|potential_size|used|used_pct
-            EXPANDABLE_ITEMS=(
-                "/dev/mapper/ubuntu--vg-ubuntu--lv|ubuntu-vg|/|ext4|48G|100G|16G|33%"
-            )
-            ;;
-        2)
-            # Multiple volumes - mixed workload server
-            EXPANDABLE_ITEMS=(
-                "/dev/mapper/ubuntu--vg-ubuntu--lv|ubuntu-vg|/|ext4|48G|100G|16G|33%"
-                "/dev/mapper/data--vg-data--lv|data-vg|/data|xfs|100G|500G|89G|89%"
-                "/dev/mapper/logs--vg-logs--lv|logs-vg|/var/log|ext4|10G|15G|8G|80%"
-            )
-            ;;
-        3)
-            # No expansion available (PV needs resize first)
-            EXPANDABLE_ITEMS=()
-            ;;
-    esac
-
-    [[ ${#EXPANDABLE_ITEMS[@]} -gt 0 ]]
-}
-
 # Main scanning function - finds all expansion opportunities
 scan_system() {
-    # Demo mode - use fake data
-    if $DEMO_MODE; then
-        load_demo_data "${DEMO_SCENARIO:-1}"
-        return $?
-    fi
-
     EXPANDABLE_ITEMS=()
 
     local found_any=false
@@ -281,12 +244,8 @@ expand_single_lv() {
     echo ""
 
     # Get the PV for this VG to include pvresize
-    local pv_device=""
-    if $DEMO_MODE; then
-        pv_device="/dev/sda3"
-    else
-        pv_device=$(pvs --noheadings -o pv_name -S vg_name="$vg_name" 2>/dev/null | head -1 | xargs)
-    fi
+    local pv_device
+    pv_device=$(pvs --noheadings -o pv_name -S vg_name="$vg_name" 2>/dev/null | head -1 | xargs)
 
     echo "Steps:"
     [[ -n "$pv_device" ]] && echo -e "  1. ${DIM}pvresize $pv_device${NC}"
@@ -346,12 +305,8 @@ expand_all_lvs() {
     for item in "${EXPANDABLE_ITEMS[@]}"; do
         IFS='|' read -r lv_path vg_name mountpoint fstype _ _ _ _ <<< "$item"
 
-        local pv_device=""
-        if $DEMO_MODE; then
-            pv_device="/dev/sda3"
-        else
-            pv_device=$(pvs --noheadings -o pv_name -S vg_name="$vg_name" 2>/dev/null | head -1 | xargs)
-        fi
+        local pv_device
+        pv_device=$(pvs --noheadings -o pv_name -S vg_name="$vg_name" 2>/dev/null | head -1 | xargs)
 
         # Only resize each PV once
         if [[ -n "$pv_device" && ! " ${pvs_done[*]} " =~ " $pv_device " ]]; then
@@ -424,8 +379,6 @@ main() {
         case "$1" in
             auto|--auto|-a) AUTO_MODE=true; shift ;;
             dry-run|--dry-run|-d) DRY_RUN=true; shift ;;
-            --demo) DEMO_MODE=true; DRY_RUN=true; shift ;;
-            --demo=*) DEMO_MODE=true; DRY_RUN=true; DEMO_SCENARIO="${1#*=}"; shift ;;
             help|--help|-h) show_usage; exit 0 ;;
             --version|-v) echo "expand v$VERSION"; exit 0 ;;
             *) print_error "Unknown option: $1"; exit 1 ;;
@@ -435,17 +388,12 @@ main() {
     echo ""
     echo -e "${BOLD}expand${NC} ${DIM}v${VERSION}${NC}"
 
-    if $DEMO_MODE; then
-        echo -e "${YELLOW}(demo mode - scenario $DEMO_SCENARIO)${NC}"
-    elif $DRY_RUN; then
+    if $DRY_RUN; then
         echo -e "${YELLOW}(dry-run mode)${NC}"
     fi
 
-    # Skip root/lvm checks in demo mode
-    if ! $DEMO_MODE; then
-        check_root
-        check_lvm
-    fi
+    check_root
+    check_lvm
 
     echo -en "\nScanning... "
     if scan_system; then
