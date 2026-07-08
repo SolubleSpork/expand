@@ -21,9 +21,9 @@ curl -sL solublespork.github.io/expand | sudo bash -s auto
 
 ## What It Does
 
-After expanding a VM disk in Proxmox, the guest OS doesn't automatically use the new space. This tool runs the three commands needed:
+After expanding a VM disk in Proxmox, the guest OS doesn't automatically use the new space. This tool runs the steps needed:
 
-1. `pvresize` - Expand the LVM Physical Volume
+1. `growpart` + `pvresize` - Grow the partition and LVM Physical Volume to match the resized disk
 2. `lvextend` - Extend the Logical Volume
 3. `resize2fs` / `xfs_growfs` / `btrfs resize` - Grow the filesystem
 
@@ -72,7 +72,7 @@ Steps:
 ## Supported
 
 - Filesystems: ext4, xfs, btrfs
-- Requires: Ubuntu/Debian with LVM, root access
+- Requires: Ubuntu/Debian with LVM, `cloud-guest-utils` (for `growpart`, preinstalled on Ubuntu cloud images), root access
 
 ## License
 

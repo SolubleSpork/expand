@@ -8,7 +8,7 @@
 
 set -euo pipefail
 
-VERSION="1.0.0"
+VERSION="1.1.0"
 DRY_RUN=false
 AUTO_MODE=false
 
@@ -58,6 +58,53 @@ check_lvm() {
         print_error "LVM tools not found. Install with: apt install lvm2"
         exit 1
     fi
+}
+
+check_growpart() {
+    if ! command -v growpart &> /dev/null; then
+        print_error "growpart not found. Install with: apt install cloud-guest-utils"
+        exit 1
+    fi
+}
+
+# Grow partitions and PVs to match the real (possibly just-resized-in-Proxmox)
+# disk size, so the LVM-level free-space scan below sees accurate numbers.
+# Non-destructive to filesystem data: only touches the partition table and PV
+# metadata. Always run for real, even in dry-run mode, so scan results stay
+# accurate; lvextend/filesystem growth remain gated behind dry-run/confirm.
+sync_storage_layers() {
+    local pv_device disk disk_base pv_base partnum growpart_out
+
+    while read -r pv_device; do
+        pv_device=$(echo "$pv_device" | xargs)
+        [[ -z "$pv_device" ]] && continue
+
+        disk_base=$(lsblk -no PKNAME "$pv_device" 2>/dev/null | head -1) || true
+        [[ -z "$disk_base" ]] && continue
+        disk="/dev/$disk_base"
+
+        # Best-effort rescan so the kernel notices a bigger backing disk.
+        # Not all controllers expose this (e.g. virtio-blk); harmless no-op if missing.
+        { echo 1 > "/sys/class/block/$disk_base/device/rescan"; } 2>/dev/null || true
+
+        pv_base=$(basename "$pv_device")
+        if [[ -f "/sys/class/block/$pv_base/partition" ]]; then
+            partnum=$(cat "/sys/class/block/$pv_base/partition" 2>/dev/null || echo "")
+            if [[ -n "$partnum" ]]; then
+                growpart_out=$(growpart "$disk" "$partnum" 2>&1) && {
+                    print_success "Grew partition $pv_device to match disk size"
+                } || {
+                    [[ "$growpart_out" != *NOCHANGE* ]] && print_warning "growpart $disk $partnum: $growpart_out"
+                }
+            fi
+        fi
+
+        local before after
+        before=$(pvs --noheadings -o pv_size --units b "$pv_device" 2>/dev/null | xargs) || true
+        pvresize "$pv_device" &> /dev/null || true
+        after=$(pvs --noheadings -o pv_size --units b "$pv_device" 2>/dev/null | xargs) || true
+        [[ -n "$before" && -n "$after" && "$before" != "$after" ]] && print_success "Resized PV $pv_device"
+    done < <(pvs --noheadings -o pv_name 2>/dev/null)
 }
 
 # Convert size string to bytes for comparison
@@ -149,11 +196,8 @@ show_scan_results() {
         echo ""
         echo -e "${DIM}No expansion opportunities found.${NC}"
         echo ""
-        echo "If you recently expanded a disk in Proxmox, you may need to:"
-        echo "  1. Resize the partition (growpart or parted)"
-        echo "  2. Resize the PV (pvresize /dev/sdaX)"
-        echo ""
-        echo "Then run this tool again."
+        echo "No free space available to expand into. If you recently expanded"
+        echo "the disk in Proxmox, double-check the resize completed there."
         exit 0
     fi
 
@@ -243,28 +287,22 @@ expand_single_lv() {
     echo -e "${DIM}$lv_path${NC}"
     echo ""
 
-    # Get the PV for this VG to include pvresize
-    local pv_device
-    pv_device=$(pvs --noheadings -o pv_name -S vg_name="$vg_name" 2>/dev/null | head -1 | xargs)
-
     echo "Steps:"
-    [[ -n "$pv_device" ]] && echo -e "  1. ${DIM}pvresize $pv_device${NC}"
-    echo -e "  2. ${DIM}lvextend -l +100%FREE $lv_path${NC}"
+    echo -e "  1. ${DIM}lvextend -l +100%FREE $lv_path${NC}"
     case "$fstype" in
         ext4|ext3|ext2)
-            echo -e "  3. ${DIM}resize2fs $lv_path${NC}"
+            echo -e "  2. ${DIM}resize2fs $lv_path${NC}"
             ;;
         xfs)
-            echo -e "  3. ${DIM}xfs_growfs $mountpoint${NC}"
+            echo -e "  2. ${DIM}xfs_growfs $mountpoint${NC}"
             ;;
         btrfs)
-            echo -e "  3. ${DIM}btrfs filesystem resize max $mountpoint${NC}"
+            echo -e "  2. ${DIM}btrfs filesystem resize max $mountpoint${NC}"
             ;;
     esac
     echo ""
 
     if $DRY_RUN || confirm "Proceed?"; then
-        [[ -n "$pv_device" ]] && run_cmd "pvresize $pv_device"
         run_cmd "lvextend -l +100%FREE $lv_path"
 
         case "$fstype" in
@@ -299,33 +337,16 @@ expand_all_lvs() {
         fi
     fi
 
-    # First, resize all PVs
-    echo -e "${DIM}Step 1: Resizing physical volumes...${NC}"
-    local pvs_done=()
-    for item in "${EXPANDABLE_ITEMS[@]}"; do
-        IFS='|' read -r lv_path vg_name mountpoint fstype _ _ _ _ <<< "$item"
-
-        local pv_device
-        pv_device=$(pvs --noheadings -o pv_name -S vg_name="$vg_name" 2>/dev/null | head -1 | xargs)
-
-        # Only resize each PV once
-        if [[ -n "$pv_device" && ! " ${pvs_done[*]} " =~ " $pv_device " ]]; then
-            run_cmd "pvresize $pv_device"
-            pvs_done+=("$pv_device")
-        fi
-    done
-    echo ""
-
-    # Then extend all LVs
-    echo -e "${DIM}Step 2: Extending logical volumes...${NC}"
+    # Extend all LVs
+    echo -e "${DIM}Step 1: Extending logical volumes...${NC}"
     for item in "${EXPANDABLE_ITEMS[@]}"; do
         IFS='|' read -r lv_path vg_name mountpoint fstype _ _ _ _ <<< "$item"
         run_cmd "lvextend -l +100%FREE $lv_path"
     done
     echo ""
 
-    # Finally resize all filesystems
-    echo -e "${DIM}Step 3: Resizing filesystems...${NC}"
+    # Then resize all filesystems
+    echo -e "${DIM}Step 2: Resizing filesystems...${NC}"
     for item in "${EXPANDABLE_ITEMS[@]}"; do
         IFS='|' read -r lv_path vg_name mountpoint fstype _ _ _ _ <<< "$item"
 
@@ -368,7 +389,7 @@ ${BOLD}Options:${NC}
   help       Show this help
 
 ${BOLD}What it does:${NC}
-  1. pvresize  - Expand PV to use full disk (if needed)
+  1. growpart + pvresize - Grow the partition and PV to match the disk
   2. lvextend  - Extend LV to use free VG space
   3. resize2fs/xfs_growfs/btrfs resize - Grow the filesystem
 EOF
@@ -394,6 +415,11 @@ main() {
 
     check_root
     check_lvm
+    check_growpart
+
+    echo -en "\nSyncing partition/LVM layers... "
+    sync_storage_layers
+    echo "done."
 
     echo -en "\nScanning... "
     if scan_system; then
@@ -410,10 +436,8 @@ main() {
         echo ""
         echo -e "${DIM}No expansion opportunities found.${NC}"
         echo ""
-        echo "If you recently expanded a disk in Proxmox:"
-        echo "  1. The partition may need resizing first: growpart /dev/sda 3"
-        echo "  2. Then resize the PV: pvresize /dev/sda3"
-        echo "  3. Run this tool again"
+        echo "No free space available to expand into. If you recently expanded"
+        echo "the disk in Proxmox, double-check the resize completed there."
         echo ""
     fi
 }
