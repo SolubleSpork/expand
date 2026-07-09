@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# expand - Ubuntu LVM Filesystem Expansion Tool
+# expand - Ubuntu Filesystem Expansion Tool (LVM and plain partitions)
 # https://github.com/SolubleSpork/expand
 #
 # Usage: curl -sL solublespork.github.io/expand | sudo bash
@@ -8,9 +8,10 @@
 
 set -euo pipefail
 
-VERSION="1.1.0"
+VERSION="2.0.0"
 DRY_RUN=false
 AUTO_MODE=false
+HAVE_LVM=false
 
 # Colors
 RED='\033[0;31m'
@@ -54,9 +55,10 @@ check_root() {
 }
 
 check_lvm() {
-    if ! command -v pvs &> /dev/null; then
-        print_error "LVM tools not found. Install with: apt install lvm2"
-        exit 1
+    if command -v pvs &> /dev/null; then
+        HAVE_LVM=true
+    else
+        HAVE_LVM=false
     fi
 }
 
@@ -67,44 +69,81 @@ check_growpart() {
     fi
 }
 
-# Grow partitions and PVs to match the real (possibly just-resized-in-Proxmox)
-# disk size, so the LVM-level free-space scan below sees accurate numbers.
-# Non-destructive to filesystem data: only touches the partition table and PV
-# metadata. Always run for real, even in dry-run mode, so scan results stay
-# accurate; lvextend/filesystem growth remain gated behind dry-run/confirm.
+is_supported_fstype() {
+    case "$1" in
+        ext4|ext3|ext2|xfs|btrfs) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# Disks already rescanned this run, so a disk with multiple partitions
+# (e.g. sda2 + sda3 both on sda) only gets rescanned once.
+declare -a RESCANNED_DISKS=()
+
+rescan_disk_once() {
+    local disk_base="$1"
+    [[ " ${RESCANNED_DISKS[*]} " == *" $disk_base "* ]] && return
+    # Best-effort: not all controllers expose this (e.g. virtio-blk); harmless no-op if missing.
+    { echo 1 > "/sys/class/block/$disk_base/device/rescan"; } 2>/dev/null || true
+    RESCANNED_DISKS+=("$disk_base")
+}
+
+# Grow the partition backing $1 (a partition device, e.g. /dev/sda3) to match
+# the real disk size. Non-destructive: only rewrites the partition table.
+grow_partition() {
+    local part_device="$1" part_base disk_base disk partnum growpart_out
+
+    part_base=$(basename "$part_device")
+    disk_base=$(lsblk -no PKNAME "$part_device" 2>/dev/null | head -1) || true
+    [[ -z "$disk_base" ]] && return
+    disk="/dev/$disk_base"
+
+    rescan_disk_once "$disk_base"
+
+    [[ -f "/sys/class/block/$part_base/partition" ]] || return
+    partnum=$(cat "/sys/class/block/$part_base/partition" 2>/dev/null || echo "")
+    [[ -z "$partnum" ]] && return
+
+    growpart_out=$(growpart "$disk" "$partnum" 2>&1) && {
+        print_success "Grew partition $part_device to match disk size"
+    } || {
+        [[ "$growpart_out" != *NOCHANGE* ]] && print_warning "growpart $disk $partnum: $growpart_out"
+    }
+}
+
+# Grow partitions (and PVs, where LVM is in use) to match the real (possibly
+# just-resized-in-Proxmox) disk size, so the free-space scan below sees
+# accurate numbers whether or not LVM is involved. Non-destructive to
+# filesystem data: only touches the partition table and PV metadata. Always
+# runs for real, even in dry-run mode, so scan results stay accurate;
+# lvextend/filesystem growth remain gated behind dry-run/confirm.
 sync_storage_layers() {
-    local pv_device disk disk_base pv_base partnum growpart_out
+    local pv_device pv_list=" "
 
-    while read -r pv_device; do
-        pv_device=$(echo "$pv_device" | xargs)
-        [[ -z "$pv_device" ]] && continue
+    if $HAVE_LVM; then
+        while read -r pv_device; do
+            pv_device=$(echo "$pv_device" | xargs)
+            [[ -z "$pv_device" ]] && continue
+            pv_list+="$pv_device "
 
-        disk_base=$(lsblk -no PKNAME "$pv_device" 2>/dev/null | head -1) || true
-        [[ -z "$disk_base" ]] && continue
-        disk="/dev/$disk_base"
+            grow_partition "$pv_device"
 
-        # Best-effort rescan so the kernel notices a bigger backing disk.
-        # Not all controllers expose this (e.g. virtio-blk); harmless no-op if missing.
-        { echo 1 > "/sys/class/block/$disk_base/device/rescan"; } 2>/dev/null || true
+            local before after
+            before=$(pvs --noheadings -o pv_size --units b "$pv_device" 2>/dev/null | xargs) || true
+            pvresize "$pv_device" &> /dev/null || true
+            after=$(pvs --noheadings -o pv_size --units b "$pv_device" 2>/dev/null | xargs) || true
+            [[ -n "$before" && -n "$after" && "$before" != "$after" ]] && print_success "Resized PV $pv_device"
+        done < <(pvs --noheadings -o pv_name 2>/dev/null)
+    fi
 
-        pv_base=$(basename "$pv_device")
-        if [[ -f "/sys/class/block/$pv_base/partition" ]]; then
-            partnum=$(cat "/sys/class/block/$pv_base/partition" 2>/dev/null || echo "")
-            if [[ -n "$partnum" ]]; then
-                growpart_out=$(growpart "$disk" "$partnum" 2>&1) && {
-                    print_success "Grew partition $pv_device to match disk size"
-                } || {
-                    [[ "$growpart_out" != *NOCHANGE* ]] && print_warning "growpart $disk $partnum: $growpart_out"
-                }
-            fi
-        fi
-
-        local before after
-        before=$(pvs --noheadings -o pv_size --units b "$pv_device" 2>/dev/null | xargs) || true
-        pvresize "$pv_device" &> /dev/null || true
-        after=$(pvs --noheadings -o pv_size --units b "$pv_device" 2>/dev/null | xargs) || true
-        [[ -n "$before" && -n "$after" && "$before" != "$after" ]] && print_success "Resized PV $pv_device"
-    done < <(pvs --noheadings -o pv_name 2>/dev/null)
+    # Plain (non-LVM) mounted partitions: grow directly, no PV involved.
+    local name fstype mountpoint
+    while read -r name fstype mountpoint; do
+        [[ -z "$name" || -z "$mountpoint" ]] && continue
+        is_supported_fstype "$fstype" || continue
+        [[ "$pv_list" == *" /dev/$name "* ]] && continue
+        grow_partition "/dev/$name"
+    done < <(lsblk -rno NAME,FSTYPE,MOUNTPOINT 2>/dev/null)
 }
 
 # Convert size string to bytes for comparison
@@ -128,63 +167,97 @@ scan_system() {
     EXPANDABLE_ITEMS=()
 
     local found_any=false
+    local pv_list=" "
 
-    # Get VG info (free space and total size)
-    declare -A vg_free
-    declare -A vg_size
-    while read -r vg_name free_space total_size; do
-        vg_name=$(echo "$vg_name" | xargs)
-        free_space=$(echo "$free_space" | xargs)
-        total_size=$(echo "$total_size" | xargs)
-        if [[ -n "$vg_name" ]]; then
-            vg_free["$vg_name"]="$free_space"
-            vg_size["$vg_name"]="$total_size"
-        fi
-    done < <(vgs --noheadings -o vg_name,vg_free,vg_size --units g 2>/dev/null)
+    if $HAVE_LVM; then
+        # Get VG info (free space and total size)
+        declare -A vg_free
+        declare -A vg_size
+        while read -r vg_name free_space total_size; do
+            vg_name=$(echo "$vg_name" | xargs)
+            free_space=$(echo "$free_space" | xargs)
+            total_size=$(echo "$total_size" | xargs)
+            if [[ -n "$vg_name" ]]; then
+                vg_free["$vg_name"]="$free_space"
+                vg_size["$vg_name"]="$total_size"
+            fi
+        done < <(vgs --noheadings -o vg_name,vg_free,vg_size --units g 2>/dev/null)
 
-    # Scan each LV
-    while read -r lv_line; do
-        [[ -z "$lv_line" ]] && continue
+        # Scan each LV
+        while read -r lv_line; do
+            [[ -z "$lv_line" ]] && continue
 
-        local lv_path lv_size vg_name
-        lv_path=$(echo "$lv_line" | awk '{print $1}' | xargs)
-        lv_size=$(echo "$lv_line" | awk '{print $2}' | xargs)
-        vg_name=$(echo "$lv_line" | awk '{print $3}' | xargs)
+            local lv_path lv_size vg_name
+            lv_path=$(echo "$lv_line" | awk '{print $1}' | xargs)
+            lv_size=$(echo "$lv_line" | awk '{print $2}' | xargs)
+            vg_name=$(echo "$lv_line" | awk '{print $3}' | xargs)
 
-        [[ -z "$lv_path" ]] && continue
+            [[ -z "$lv_path" ]] && continue
 
-        local mountpoint fstype fs_size fs_used fs_pct
-        mountpoint=$(findmnt -n -o TARGET "$lv_path" 2>/dev/null || echo "")
-        fstype=$(blkid -o value -s TYPE "$lv_path" 2>/dev/null || echo "unknown")
+            local mountpoint fstype fs_size fs_used fs_pct
+            mountpoint=$(findmnt -n -o TARGET "$lv_path" 2>/dev/null || echo "")
+            fstype=$(blkid -o value -s TYPE "$lv_path" 2>/dev/null || echo "unknown")
 
-        # Get filesystem usage if mounted
-        if [[ -n "$mountpoint" ]]; then
-            read -r fs_size fs_used fs_pct < <(df -h "$mountpoint" 2>/dev/null | tail -1 | awk '{print $2, $3, $5}')
-        else
-            fs_size="$lv_size"
-            fs_used="-"
-            fs_pct="-"
-        fi
+            # Get filesystem usage if mounted
+            if [[ -n "$mountpoint" ]]; then
+                read -r fs_size fs_used fs_pct < <(df -h "$mountpoint" 2>/dev/null | tail -1 | awk '{print $2, $3, $5}')
+            else
+                fs_size="$lv_size"
+                fs_used="-"
+                fs_pct="-"
+            fi
 
-        # Check if VG has free space
-        local free="${vg_free[$vg_name]:-0}"
-        local free_bytes
-        free_bytes=$(size_to_bytes "$free")
+            # Check if VG has free space
+            local free="${vg_free[$vg_name]:-0}"
+            local free_bytes
+            free_bytes=$(size_to_bytes "$free")
 
-        # Only show if there's meaningful free space (> 100MB)
-        if (( $(echo "$free_bytes > 104857600" | bc 2>/dev/null || echo 0) )); then
+            # Only show if there's meaningful free space (> 100MB)
+            if (( $(echo "$free_bytes > 104857600" | bc 2>/dev/null || echo 0) )); then
+                found_any=true
+
+                # Calculate potential size (current + free)
+                local current_num free_num potential_size
+                current_num=$(echo "$fs_size" | sed 's/[^0-9.]//g')
+                free_num=$(echo "$free" | sed 's/[^0-9.]//g')
+                potential_size=$(echo "$current_num + $free_num" | bc 2>/dev/null || echo "?")
+
+                # format: lv_path|vg_name|mountpoint|fstype|current_fs_size|potential_size|used|used_pct
+                EXPANDABLE_ITEMS+=("$lv_path|$vg_name|$mountpoint|$fstype|$fs_size|${potential_size}G|$fs_used|$fs_pct")
+            fi
+        done < <(lvs --noheadings -o lv_path,lv_size,vg_name --units g 2>/dev/null)
+
+        while read -r pv_device; do
+            pv_device=$(echo "$pv_device" | xargs)
+            [[ -n "$pv_device" ]] && pv_list+="$pv_device "
+        done < <(pvs --noheadings -o pv_name 2>/dev/null)
+    fi
+
+    # Scan plain (non-LVM) mounted partitions with a supported filesystem
+    local name fstype mountpoint
+    while read -r name fstype mountpoint; do
+        [[ -z "$name" || -z "$mountpoint" ]] && continue
+        is_supported_fstype "$fstype" || continue
+        [[ "$pv_list" == *" /dev/$name "* ]] && continue
+
+        local part_bytes fs_size fs_used fs_pct fs_bytes
+        part_bytes=$(blockdev --getsize64 "/dev/$name" 2>/dev/null || echo 0)
+        read -r fs_size fs_used fs_pct < <(df -h "$mountpoint" 2>/dev/null | tail -1 | awk '{print $2, $3, $5}')
+        fs_bytes=$(size_to_bytes "$fs_size")
+
+        # Only show if the partition has meaningfully more room than the filesystem (> 100MB)
+        local slack
+        slack=$(echo "$part_bytes - $fs_bytes" | bc 2>/dev/null || echo 0)
+        if (( $(echo "$slack > 104857600" | bc 2>/dev/null || echo 0) )); then
             found_any=true
 
-            # Calculate potential size (current + free)
-            local current_num free_num potential_size
-            current_num=$(echo "$fs_size" | sed 's/[^0-9.]//g')
-            free_num=$(echo "$free" | sed 's/[^0-9.]//g')
-            potential_size=$(echo "$current_num + $free_num" | bc 2>/dev/null || echo "?")
+            local potential_size
+            potential_size=$(echo "scale=1; $part_bytes / 1073741824" | bc 2>/dev/null || echo "?")
 
-            # format: lv_path|vg_name|mountpoint|fstype|current_fs_size|potential_size|used|used_pct
-            EXPANDABLE_ITEMS+=("$lv_path|$vg_name|$mountpoint|$fstype|$fs_size|${potential_size}G|$fs_used|$fs_pct")
+            # vg_name left empty to mark this as a plain (non-LVM) partition
+            EXPANDABLE_ITEMS+=("/dev/$name||$mountpoint|$fstype|$fs_size|${potential_size}G|$fs_used|$fs_pct")
         fi
-    done < <(lvs --noheadings -o lv_path,lv_size,vg_name --units g 2>/dev/null)
+    done < <(lsblk -rno NAME,FSTYPE,MOUNTPOINT 2>/dev/null)
 
     $found_any
 }
@@ -287,23 +360,27 @@ expand_single_lv() {
     echo -e "${DIM}$lv_path${NC}"
     echo ""
 
+    local step=1
     echo "Steps:"
-    echo -e "  1. ${DIM}lvextend -l +100%FREE $lv_path${NC}"
+    if [[ -n "$vg_name" ]]; then
+        echo -e "  $step. ${DIM}lvextend -l +100%FREE $lv_path${NC}"
+        ((step++))
+    fi
     case "$fstype" in
         ext4|ext3|ext2)
-            echo -e "  2. ${DIM}resize2fs $lv_path${NC}"
+            echo -e "  $step. ${DIM}resize2fs $lv_path${NC}"
             ;;
         xfs)
-            echo -e "  2. ${DIM}xfs_growfs $mountpoint${NC}"
+            echo -e "  $step. ${DIM}xfs_growfs $mountpoint${NC}"
             ;;
         btrfs)
-            echo -e "  2. ${DIM}btrfs filesystem resize max $mountpoint${NC}"
+            echo -e "  $step. ${DIM}btrfs filesystem resize max $mountpoint${NC}"
             ;;
     esac
     echo ""
 
     if $DRY_RUN || confirm "Proceed?"; then
-        run_cmd "lvextend -l +100%FREE $lv_path"
+        [[ -n "$vg_name" ]] && run_cmd "lvextend -l +100%FREE $lv_path"
 
         case "$fstype" in
             ext4|ext3|ext2)
@@ -337,11 +414,11 @@ expand_all_lvs() {
         fi
     fi
 
-    # Extend all LVs
+    # Extend all LVs (plain partitions were already grown by sync_storage_layers)
     echo -e "${DIM}Step 1: Extending logical volumes...${NC}"
     for item in "${EXPANDABLE_ITEMS[@]}"; do
         IFS='|' read -r lv_path vg_name mountpoint fstype _ _ _ _ <<< "$item"
-        run_cmd "lvextend -l +100%FREE $lv_path"
+        [[ -n "$vg_name" ]] && run_cmd "lvextend -l +100%FREE $lv_path"
     done
     echo ""
 
@@ -376,7 +453,7 @@ expand_all_lvs() {
 
 show_usage() {
     cat << EOF
-${BOLD}expand${NC} v${VERSION} - LVM Filesystem Expansion Tool
+${BOLD}expand${NC} v${VERSION} - Filesystem Expansion Tool (LVM and plain partitions)
 
 ${BOLD}Usage:${NC}
   curl -sL solublespork.github.io/expand | sudo bash
@@ -389,8 +466,8 @@ ${BOLD}Options:${NC}
   help       Show this help
 
 ${BOLD}What it does:${NC}
-  1. growpart + pvresize - Grow the partition and PV to match the disk
-  2. lvextend  - Extend LV to use free VG space
+  1. growpart (+ pvresize if using LVM) - Grow the partition to match the disk
+  2. lvextend  - Extend LV to use free VG space (LVM only)
   3. resize2fs/xfs_growfs/btrfs resize - Grow the filesystem
 EOF
 }

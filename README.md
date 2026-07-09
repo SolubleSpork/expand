@@ -1,6 +1,7 @@
 # expand
 
-Expand LVM filesystems on Ubuntu VMs after increasing disk size in Proxmox.
+Expand filesystems on Ubuntu VMs after increasing disk size in Proxmox.
+Works with both LVM and plain-partition (non-LVM) layouts.
 
 ## Quick Start
 
@@ -21,17 +22,18 @@ curl -sL solublespork.github.io/expand | sudo bash -s auto
 
 ## What It Does
 
-After expanding a VM disk in Proxmox, the guest OS doesn't automatically use the new space. This tool runs the steps needed:
+After expanding a VM disk in Proxmox, the guest OS doesn't automatically use the new space. This tool runs the steps needed, automatically detecting whether you're using LVM or plain partitions:
 
-1. `growpart` + `pvresize` - Grow the partition and LVM Physical Volume to match the resized disk
-2. `lvextend` - Extend the Logical Volume
+1. `growpart` - Grow the partition to match the resized disk (+ `pvresize` if using LVM)
+2. `lvextend` - Extend the Logical Volume (LVM only)
 3. `resize2fs` / `xfs_growfs` / `btrfs resize` - Grow the filesystem
 
 ## Example
 
 ```
-expand v1.0.0
+expand v2.0.0
 
+Syncing partition/LVM layers... done.
 Scanning... done.
 
 Found 1 volume that can be expanded:
@@ -49,17 +51,17 @@ Expanding: /
 /dev/mapper/ubuntu--vg-ubuntu--lv
 
 Steps:
-  1. pvresize /dev/sda3
-  2. lvextend -l +100%FREE /dev/mapper/ubuntu--vg-ubuntu--lv
-  3. resize2fs /dev/mapper/ubuntu--vg-ubuntu--lv
+  1. lvextend -l +100%FREE /dev/mapper/ubuntu--vg-ubuntu--lv
+  2. resize2fs /dev/mapper/ubuntu--vg-ubuntu--lv
 
 ? Proceed? [y/N] y
-    Running: pvresize /dev/sda3
     Running: lvextend -l +100%FREE /dev/mapper/ubuntu--vg-ubuntu--lv
     Running: resize2fs /dev/mapper/ubuntu--vg-ubuntu--lv
 
 ✓ Expansion complete!
 ```
+
+Partition/PV growth (`growpart`/`pvresize`) now happens automatically during the "Syncing" step, before the scan, so it no longer shows up as a per-volume step you have to confirm.
 
 ## Typical Workflow
 
@@ -72,7 +74,8 @@ Steps:
 ## Supported
 
 - Filesystems: ext4, xfs, btrfs
-- Requires: Ubuntu/Debian with LVM, `cloud-guest-utils` (for `growpart`, preinstalled on Ubuntu cloud images), root access
+- Layouts: LVM or plain partitions
+- Requires: Ubuntu/Debian, `cloud-guest-utils` (for `growpart`, preinstalled on Ubuntu cloud images), root access. `lvm2` only needed if you're actually using LVM.
 
 ## License
 
