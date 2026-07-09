@@ -80,12 +80,21 @@ is_supported_fstype() {
 # (e.g. sda2 + sda3 both on sda) only gets rescanned once.
 declare -a RESCANNED_DISKS=()
 
+# NOTE: every exit path below is an explicit `return 0`. These are called as
+# bare statements in loops under `set -e` -- a function that implicitly
+# returns non-zero (e.g. via a bare `return` right after a failed `[[ ]]`, or
+# via the exit status of its last `&&`/`||` branch) would silently kill the
+# whole script the moment that non-zero path is taken, which for growpart's
+# very common "nothing left to grow" case is most runs after the first.
 rescan_disk_once() {
     local disk_base="$1"
-    [[ " ${RESCANNED_DISKS[*]} " == *" $disk_base "* ]] && return
+    if [[ " ${RESCANNED_DISKS[*]} " == *" $disk_base "* ]]; then
+        return 0
+    fi
     # Best-effort: not all controllers expose this (e.g. virtio-blk); harmless no-op if missing.
     { echo 1 > "/sys/class/block/$disk_base/device/rescan"; } 2>/dev/null || true
     RESCANNED_DISKS+=("$disk_base")
+    return 0
 }
 
 # Grow the partition backing $1 (a partition device, e.g. /dev/sda3) to match
@@ -95,20 +104,27 @@ grow_partition() {
 
     part_base=$(basename "$part_device")
     disk_base=$(lsblk -no PKNAME "$part_device" 2>/dev/null | head -1) || true
-    [[ -z "$disk_base" ]] && return
+    if [[ -z "$disk_base" ]]; then
+        return 0
+    fi
     disk="/dev/$disk_base"
 
     rescan_disk_once "$disk_base"
 
-    [[ -f "/sys/class/block/$part_base/partition" ]] || return
+    if [[ ! -f "/sys/class/block/$part_base/partition" ]]; then
+        return 0
+    fi
     partnum=$(cat "/sys/class/block/$part_base/partition" 2>/dev/null || echo "")
-    [[ -z "$partnum" ]] && return
+    if [[ -z "$partnum" ]]; then
+        return 0
+    fi
 
-    growpart_out=$(growpart "$disk" "$partnum" 2>&1) && {
+    if growpart_out=$(growpart "$disk" "$partnum" 2>&1); then
         print_success "Grew partition $part_device to match disk size"
-    } || {
-        [[ "$growpart_out" != *NOCHANGE* ]] && print_warning "growpart $disk $partnum: $growpart_out"
-    }
+    elif [[ "$growpart_out" != *NOCHANGE* ]]; then
+        print_warning "growpart $disk $partnum: $growpart_out"
+    fi
+    return 0
 }
 
 # Grow partitions (and PVs, where LVM is in use) to match the real (possibly
