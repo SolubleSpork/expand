@@ -107,13 +107,13 @@ expand v2.0.0
 
 ## Development & Releases
 
-`main` is the active development branch. The installer never fetches from it directly — it fetches from a dedicated `release` branch (what GitHub Pages actually serves), which only moves forward when a version is deliberately released. This means:
+`main` is both the working branch and what the installer fetches directly — there's no separate release branch. Changes are developed and tested locally; nothing reaches GitHub until it's pushed, and that push is itself what ships it, so:
 
 ```bash
 curl -sL solublespork.github.io/expand | sudo bash
 ```
 
-always installs the last released version, even while unreleased changes are sitting on `main`.
+always installs whatever was last pushed to `main`.
 
 ## License
 
