@@ -68,14 +68,52 @@ Partition/PV growth (`growpart`/`pvresize`) now happens automatically during the
 1. Expand VM disk in Proxmox (VM → Hardware → Hard Disk → Resize)
 2. SSH into the VM
 3. Run: `curl -sL solublespork.github.io/expand | sudo bash`
-4. Select the volume to expand (or use `--auto`)
+4. Select the volume to expand (or use `auto`)
 5. Done!
 
-## Supported
+## Requirements
 
 - Filesystems: ext4, xfs, btrfs
 - Layouts: LVM or plain partitions
 - Requires: Ubuntu/Debian, `cloud-guest-utils` (for `growpart`, preinstalled on Ubuntu cloud images), root access. `lvm2` only needed if you're actually using LVM.
+
+## Usage
+
+```
+$ curl -sL solublespork.github.io/expand | sudo bash -s help
+
+expand v2.0.0 - Filesystem Expansion Tool (LVM and plain partitions)
+
+Usage:
+  curl -sL solublespork.github.io/expand | sudo bash
+  curl -sL solublespork.github.io/expand | sudo bash -s auto
+  curl -sL solublespork.github.io/expand | sudo bash -s dry-run
+
+Options:
+  auto       Expand everything automatically (no prompts)
+  dry-run    Show what would happen without making changes
+  help       Show this help
+
+What it does:
+  1. growpart (+ pvresize if using LVM) - Grow the partition to match the disk
+  2. lvextend  - Extend LV to use free VG space (LVM only)
+  3. resize2fs/xfs_growfs/btrfs resize - Grow the filesystem
+```
+
+```
+$ curl -sL solublespork.github.io/expand | sudo bash -s --version
+expand v2.0.0
+```
+
+## Development & Releases
+
+`main` is the active development branch. The installer never fetches from it directly — it fetches from a dedicated `release` branch (what GitHub Pages actually serves), which only moves forward when a version is deliberately released. This means:
+
+```bash
+curl -sL solublespork.github.io/expand | sudo bash
+```
+
+always installs the last released version, even while unreleased changes are sitting on `main`.
 
 ## License
 
