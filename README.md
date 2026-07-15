@@ -3,6 +3,14 @@
 Expand filesystems on Ubuntu VMs after increasing disk size in Proxmox.
 Works with both LVM and plain-partition (non-LVM) layouts.
 
+## Features
+
+- Single curl-pipe install, no dependencies to manage
+- Auto-detects LVM vs. plain-partition layouts
+- Supports ext4, xfs, and btrfs
+- Interactive mode (choose what to expand) or `auto` mode (expand everything)
+- `dry-run` mode to preview changes before making them
+
 ## Quick Start
 
 ```bash
