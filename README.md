@@ -7,6 +7,7 @@ Works with both LVM and plain-partition (non-LVM) layouts.
 
 - Single curl-pipe install, no dependencies to manage
 - Auto-detects LVM vs. plain-partition layouts
+- Handles LVM disks where another partition blocks growth (e.g. an EFI partition added after a BIOS→UEFI switch) by adding the free space as a new PV
 - Supports ext4, xfs, and btrfs
 - Interactive mode (choose what to expand) or `auto` mode (expand everything)
 - `dry-run` mode to preview changes before making them
@@ -33,6 +34,7 @@ curl -sL solublespork.github.io/expand | sudo bash -s auto
 After expanding a VM disk in Proxmox, the guest OS doesn't automatically use the new space. This tool runs the steps needed, automatically detecting whether you're using LVM or plain partitions:
 
 1. `growpart` - Grow the partition to match the resized disk (+ `pvresize` if using LVM)
+   - If another partition sits after the LVM partition so it can't grow, the free space at the end of the disk is offered instead as a new partition added to the same volume group (`parted` + `pvcreate` + `vgextend`, after you confirm)
 2. `lvextend` - Extend the Logical Volume (LVM only)
 3. `resize2fs` / `xfs_growfs` / `btrfs resize` - Grow the filesystem
 
@@ -83,7 +85,7 @@ Partition/PV growth (`growpart`/`pvresize`) now happens automatically during the
 
 - Filesystems: ext4, xfs, btrfs
 - Layouts: LVM or plain partitions
-- Requires: Ubuntu/Debian, `cloud-guest-utils` (for `growpart`, preinstalled on Ubuntu cloud images), root access. `lvm2` only needed if you're actually using LVM.
+- Requires: Ubuntu/Debian, `cloud-guest-utils` (for `growpart`, preinstalled on Ubuntu cloud images), root access. `lvm2` only needed if you're actually using LVM. `gdisk` and `parted` are only needed when free space has to be added as a new PV (the tool tells you if they're missing).
 
 ## Usage
 
@@ -104,6 +106,8 @@ Options:
 
 What it does:
   1. growpart (+ pvresize if using LVM) - Grow the partition to match the disk
+     If the PV's partition isn't last (so it can't grow), free space at the
+     end of the disk is offered as a new PV added to the same VG instead
   2. lvextend  - Extend LV to use free VG space (LVM only)
   3. resize2fs/xfs_growfs/btrfs resize - Grow the filesystem
 ```

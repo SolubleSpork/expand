@@ -9,7 +9,7 @@
 set -euo pipefail
 
 # version.json is the source of truth -- keep this in sync with it on every release.
-VERSION="2.0.0"
+VERSION="2.1.0-beta"
 DRY_RUN=false
 AUTO_MODE=false
 HAVE_LVM=false
@@ -26,6 +26,14 @@ NC='\033[0m'
 
 # Global array to store scan results
 declare -a EXPANDABLE_ITEMS=()
+
+# Unallocated space at the end of a disk that growpart can't reach, keyed by
+# the VG it would be added to (see find_new_pv_space).
+declare -A NEWPV_DISK=()
+declare -A NEWPV_BYTES=()
+
+# Warnings collected during the scan, printed after it finishes.
+declare -a SCAN_NOTES=()
 
 print_success() { echo -e "${GREEN}✓${NC} $1"; }
 print_error() { echo -e "${RED}✗${NC} $1"; }
@@ -163,6 +171,150 @@ sync_storage_layers() {
     done < <(lsblk -rno NAME,FSTYPE,MOUNTPOINT 2>/dev/null)
 }
 
+# Print "<start_mib> <partnum> <partition device>" for a new partition that
+# would fill the unallocated space after the last partition on $1. partnum is
+# the lowest unused number, which is what parted assigns on GPT.
+new_pv_layout() {
+    local disk="$1" ss last_end used n=1 sep=""
+    ss=$(blockdev --getss "$disk" 2>/dev/null || echo 512)
+    last_end=$(partx -g -o END "$disk" 2>/dev/null | sort -n | tail -1 | xargs) || true
+    used=$(partx -g -o NR "$disk" 2>/dev/null | tr -d ' ') || true
+    while grep -qx "$n" <<< "$used"; do
+        n=$((n + 1))
+    done
+    [[ "$disk" =~ [0-9]$ ]] && sep="p"
+    echo "$(( ((${last_end:-0} + 1) * ss + 1048575) / 1048576 )) $n ${disk}${sep}${n}"
+    return 0
+}
+
+# Find unallocated space (> 100MB) at the end of a GPT disk holding an LVM PV
+# whose partition isn't the last one, so growpart can't grow it -- e.g. a
+# legacy-BIOS install later switched to UEFI, with the EFI partition appended
+# after the PV. Read-only: results feed scan_system, and the partition is only
+# created by prepare_new_pv after confirmation. Works out free space from the
+# real disk size rather than the GPT header, which may not have been moved to
+# the new end of the disk yet.
+find_new_pv_space() {
+    NEWPV_DISK=()
+    NEWPV_BYTES=()
+    $HAVE_LVM || return 0
+
+    local -A disk_vgs=() disk_pvparts=()
+    local pv_device vg part_base disk_base partnum
+    while read -r pv_device vg; do
+        [[ -z "$pv_device" || -z "$vg" ]] && continue
+        part_base=$(basename "$pv_device")
+        [[ -f "/sys/class/block/$part_base/partition" ]] || continue
+        disk_base=$(lsblk -no PKNAME "$pv_device" 2>/dev/null | head -1) || true
+        [[ -z "$disk_base" ]] && continue
+        partnum=$(cat "/sys/class/block/$part_base/partition" 2>/dev/null || echo "")
+        [[ -z "$partnum" ]] && continue
+        disk_vgs[$disk_base]+="$vg "
+        disk_pvparts[$disk_base]+="$partnum "
+    done < <(pvs --noheadings -o pv_name,vg_name 2>/dev/null)
+
+    local disk vgs vg_count pttype last_nr ss disk_bytes last_end free_bytes p t missing
+    for disk_base in "${!disk_vgs[@]}"; do
+        disk="/dev/$disk_base"
+
+        vgs=$(tr ' ' '\n' <<< "${disk_vgs[$disk_base]}" | sed '/^$/d' | sort -u)
+        vg_count=$(wc -l <<< "$vgs")
+        if [[ "$vg_count" -ne 1 ]]; then
+            SCAN_NOTES+=("$disk has PVs from more than one VG; not offering its free space")
+            continue
+        fi
+
+        pttype=$(blkid -o value -s PTTYPE "$disk" 2>/dev/null) || true
+        [[ "$pttype" == "gpt" ]] || continue
+
+        # Last partition by position on disk, not by number.
+        read -r last_nr last_end < <(partx -g -o NR,END "$disk" 2>/dev/null | sort -k2 -n | tail -1) || true
+        [[ -z "${last_nr:-}" ]] && continue
+
+        # A PV that is already the last partition is handled by growpart.
+        [[ " ${disk_pvparts[$disk_base]} " == *" $last_nr "* ]] && continue
+
+        # Only if growpart really can't grow any PV on this disk.
+        for p in ${disk_pvparts[$disk_base]}; do
+            if growpart -N "$disk" "$p" &> /dev/null; then
+                continue 2
+            fi
+        done
+
+        ss=$(blockdev --getss "$disk" 2>/dev/null || echo 512)
+        disk_bytes=$(blockdev --getsize64 "$disk" 2>/dev/null || echo 0)
+        # GPT keeps a 33-sector backup header + table at the very end.
+        free_bytes=$(( disk_bytes - 33 * ss - (last_end + 1) * ss ))
+        (( free_bytes > 104857600 )) || continue
+
+        missing=""
+        for t in sgdisk parted partprobe; do
+            command -v "$t" &> /dev/null || missing+="$t "
+        done
+        if [[ -n "$missing" ]]; then
+            SCAN_NOTES+=("$disk has $(( free_bytes / 1073741824 ))G unallocated, but ${missing% } not found (apt install gdisk parted)")
+            continue
+        fi
+
+        NEWPV_DISK[$vgs]="$disk"
+        NEWPV_BYTES[$vgs]="$free_bytes"
+    done
+    return 0
+}
+
+# Disks already given a new PV this run (so "expand all" with several LVs in
+# the same VG only creates one partition).
+declare -a PREPARED_DISKS=()
+
+# Turn the unallocated space at the end of $1 into a new PV in VG $2. Creates
+# a partition, so it only runs after the normal confirm prompt (or in auto
+# mode) -- never from sync_storage_layers. Under dry-run, run_cmd only prints.
+prepare_new_pv() {
+    local disk="$1" vg="$2" start_mib partnum new_part actual
+    if [[ " ${PREPARED_DISKS[*]} " == *" $disk "* ]]; then
+        return 0
+    fi
+    PREPARED_DISKS+=("$disk")
+
+    read -r start_mib partnum new_part < <(new_pv_layout "$disk") || true
+
+    # Move the GPT backup header to the new end of the disk first; otherwise
+    # parted -s can't use the new space (it would prompt Fix/Ignore).
+    run_cmd "sgdisk -e $disk"
+    run_cmd "parted -s -a optimal $disk mkpart lvm ${start_mib}MiB 100%"
+
+    if ! $DRY_RUN; then
+        # Make sure parted gave the partition the number we expect before
+        # setting flags on it.
+        actual=$(parted -sm "$disk" unit B print 2>/dev/null | awk -F: -v s="$(( start_mib * 1048576 ))B" '$2 == s { print $1 }') || true
+        if [[ "$actual" != "$partnum" ]]; then
+            print_error "New partition on $disk is number '${actual:-?}', expected $partnum. Stopping; nothing was added to $vg."
+            exit 1
+        fi
+    fi
+
+    run_cmd "parted -s $disk set $partnum lvm on"
+    run_cmd "partprobe $disk"
+    run_cmd "udevadm settle"
+
+    if ! $DRY_RUN && [[ ! -b "$new_part" ]]; then
+        print_error "$new_part did not appear after partprobe. Stopping; nothing was added to $vg."
+        exit 1
+    fi
+
+    run_cmd "pvcreate $new_part"
+    run_cmd "vgextend $vg $new_part"
+    return 0
+}
+
+show_scan_notes() {
+    local note
+    for note in "${SCAN_NOTES[@]}"; do
+        print_warning "$note"
+    done
+    return 0
+}
+
 # Convert size string to bytes for comparison
 size_to_bytes() {
     local size="$1"
@@ -182,11 +334,13 @@ size_to_bytes() {
 # Main scanning function - finds all expansion opportunities
 scan_system() {
     EXPANDABLE_ITEMS=()
+    SCAN_NOTES=()
 
     local found_any=false
     local pv_list=" "
 
     if $HAVE_LVM; then
+        find_new_pv_space
         # Get VG info (free space and total size)
         declare -A vg_free
         declare -A vg_size
@@ -229,6 +383,11 @@ scan_system() {
             local free_bytes
             free_bytes=$(size_to_bytes "$free")
 
+            # Plus any unallocated disk space that would be added to this VG as a new PV
+            local newpv_disk="${NEWPV_DISK[$vg_name]:-}"
+            local newpv_bytes="${NEWPV_BYTES[$vg_name]:-0}"
+            free_bytes=$(echo "$free_bytes + $newpv_bytes" | bc 2>/dev/null || echo "$free_bytes")
+
             # Only show if there's meaningful free space (> 100MB)
             if (( $(echo "$free_bytes > 104857600" | bc 2>/dev/null || echo 0) )); then
                 found_any=true
@@ -237,10 +396,14 @@ scan_system() {
                 local current_num free_num potential_size
                 current_num=$(echo "$fs_size" | sed 's/[^0-9.]//g')
                 free_num=$(echo "$free" | sed 's/[^0-9.]//g')
+                if [[ -n "$newpv_disk" ]]; then
+                    free_num=$(echo "scale=2; $free_num + $newpv_bytes / 1073741824" | bc 2>/dev/null || echo "$free_num")
+                fi
                 potential_size=$(echo "$current_num + $free_num" | bc 2>/dev/null || echo "?")
 
-                # format: lv_path|vg_name|mountpoint|fstype|current_fs_size|potential_size|used|used_pct
-                EXPANDABLE_ITEMS+=("$lv_path|$vg_name|$mountpoint|$fstype|$fs_size|${potential_size}G|$fs_used|$fs_pct")
+                # format: lv_path|vg_name|mountpoint|fstype|current_fs_size|potential_size|used|used_pct|newpv_disk
+                # newpv_disk is set when the space first has to be added to the VG as a new PV.
+                EXPANDABLE_ITEMS+=("$lv_path|$vg_name|$mountpoint|$fstype|$fs_size|${potential_size}G|$fs_used|$fs_pct|$newpv_disk")
             fi
         done < <(lvs --noheadings -o lv_path,lv_size,vg_name --units g 2>/dev/null)
 
@@ -301,7 +464,7 @@ show_scan_results() {
 
     local i=1
     for item in "${EXPANDABLE_ITEMS[@]}"; do
-        IFS='|' read -r lv_path vg_name mountpoint fstype current_size potential_size used used_pct <<< "$item"
+        IFS='|' read -r lv_path vg_name mountpoint fstype current_size potential_size used used_pct newpv_disk <<< "$item"
 
         # Calculate how much can be added
         local current_num potential_num gain
@@ -316,6 +479,9 @@ show_scan_results() {
         echo -e "     ${DIM}$lv_path${NC}"
         echo -e "     Filesystem: ${BOLD}$current_size${NC} → could be ${GREEN}$potential_size${NC} ${GREEN}(+${gain}G)${NC}"
         echo -e "     Currently using: $used ($used_pct)"
+        if [[ -n "$newpv_disk" ]]; then
+            echo -e "     ${YELLOW}Includes:${NC} add free space on $newpv_disk as new PV to $vg_name"
+        fi
         echo ""
         ((i++))
     done
@@ -368,7 +534,7 @@ show_menu() {
 
 expand_single_lv() {
     local idx="$1"
-    IFS='|' read -r lv_path vg_name mountpoint fstype current_size potential_size used used_pct <<< "${EXPANDABLE_ITEMS[$idx]}"
+    IFS='|' read -r lv_path vg_name mountpoint fstype current_size potential_size used used_pct newpv_disk <<< "${EXPANDABLE_ITEMS[$idx]}"
 
     local display_name="${mountpoint:-$lv_path}"
 
@@ -379,6 +545,13 @@ expand_single_lv() {
 
     local step=1
     echo "Steps:"
+    if [[ -n "$newpv_disk" ]]; then
+        local start_mib partnum new_part
+        read -r start_mib partnum new_part < <(new_pv_layout "$newpv_disk") || true
+        echo -e "  $step. ${DIM}Add free space on $newpv_disk as new PV $new_part to $vg_name${NC}"
+        echo -e "     ${DIM}(sgdisk -e, parted mkpart + lvm flag, partprobe, pvcreate, vgextend)${NC}"
+        ((step++))
+    fi
     if [[ -n "$vg_name" ]]; then
         echo -e "  $step. ${DIM}lvextend -l +100%FREE $lv_path${NC}"
         ((step++))
@@ -397,6 +570,7 @@ expand_single_lv() {
     echo ""
 
     if $DRY_RUN || confirm "Proceed?"; then
+        [[ -n "$newpv_disk" ]] && prepare_new_pv "$newpv_disk" "$vg_name"
         [[ -n "$vg_name" ]] && run_cmd "lvextend -l +100%FREE $lv_path"
 
         case "$fstype" in
@@ -431,18 +605,41 @@ expand_all_lvs() {
         fi
     fi
 
-    # Extend all LVs (plain partitions were already grown by sync_storage_layers)
-    echo -e "${DIM}Step 1: Extending logical volumes...${NC}"
+    local step=1 item lv_path vg_name mountpoint fstype newpv_disk needs_newpv=false
+
     for item in "${EXPANDABLE_ITEMS[@]}"; do
-        IFS='|' read -r lv_path vg_name mountpoint fstype _ _ _ _ <<< "$item"
+        IFS='|' read -r _ _ _ _ _ _ _ _ newpv_disk <<< "$item"
+        if [[ -n "$newpv_disk" ]]; then
+            needs_newpv=true
+        fi
+    done
+
+    # Add unallocated disk space to its VG as a new PV, where needed
+    if $needs_newpv; then
+        echo -e "${DIM}Step $step: Adding free disk space as new PVs...${NC}"
+        for item in "${EXPANDABLE_ITEMS[@]}"; do
+            IFS='|' read -r _ vg_name _ _ _ _ _ _ newpv_disk <<< "$item"
+            if [[ -n "$newpv_disk" ]]; then
+                prepare_new_pv "$newpv_disk" "$vg_name"
+            fi
+        done
+        echo ""
+        ((step++))
+    fi
+
+    # Extend all LVs (plain partitions were already grown by sync_storage_layers)
+    echo -e "${DIM}Step $step: Extending logical volumes...${NC}"
+    for item in "${EXPANDABLE_ITEMS[@]}"; do
+        IFS='|' read -r lv_path vg_name mountpoint fstype _ _ _ _ _ <<< "$item"
         [[ -n "$vg_name" ]] && run_cmd "lvextend -l +100%FREE $lv_path"
     done
     echo ""
+    ((step++))
 
     # Then resize all filesystems
-    echo -e "${DIM}Step 2: Resizing filesystems...${NC}"
+    echo -e "${DIM}Step $step: Resizing filesystems...${NC}"
     for item in "${EXPANDABLE_ITEMS[@]}"; do
-        IFS='|' read -r lv_path vg_name mountpoint fstype _ _ _ _ <<< "$item"
+        IFS='|' read -r lv_path vg_name mountpoint fstype _ _ _ _ _ <<< "$item"
 
         case "$fstype" in
             ext4|ext3|ext2)
@@ -484,6 +681,8 @@ ${BOLD}Options:${NC}
 
 ${BOLD}What it does:${NC}
   1. growpart (+ pvresize if using LVM) - Grow the partition to match the disk
+     If the PV's partition isn't last (so it can't grow), free space at the
+     end of the disk is offered as a new PV added to the same VG instead
   2. lvextend  - Extend LV to use free VG space (LVM only)
   3. resize2fs/xfs_growfs/btrfs resize - Grow the filesystem
 EOF
@@ -518,6 +717,7 @@ main() {
     echo -en "\nScanning... "
     if scan_system; then
         echo "done."
+        show_scan_notes
         show_scan_results
 
         if $AUTO_MODE; then
@@ -527,6 +727,7 @@ main() {
         fi
     else
         echo "done."
+        show_scan_notes
         echo ""
         echo -e "${DIM}No expansion opportunities found.${NC}"
         echo ""
