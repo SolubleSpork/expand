@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+## [2.1.0] - 2026-11-21
+
 ### Added
 - Free space at the end of a disk that `growpart` can't reach is now found and offered as an expansion option. This happens when another partition sits after the LVM partition, e.g. an EFI partition added after switching a VM from BIOS to UEFI. The space gets added to the volume group as a new partition and PV. Later resizes grow that new partition the normal way.
 

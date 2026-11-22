@@ -41,7 +41,7 @@ After expanding a VM disk in Proxmox, the guest OS doesn't automatically use the
 ## Example
 
 ```
-expand v2.0.0
+expand v2.1.0
 
 Syncing partition/LVM layers... done.
 Scanning... done.
@@ -92,7 +92,7 @@ Partition/PV growth (`growpart`/`pvresize`) now happens automatically during the
 ```
 $ curl -sL solublespork.github.io/expand | sudo bash -s help
 
-expand v2.0.0 - Filesystem Expansion Tool (LVM and plain partitions)
+expand v2.1.0 - Filesystem Expansion Tool (LVM and plain partitions)
 
 Usage:
   curl -sL solublespork.github.io/expand | sudo bash
@@ -114,7 +114,7 @@ What it does:
 
 ```
 $ curl -sL solublespork.github.io/expand | sudo bash -s --version
-expand v2.0.0
+expand v2.1.0
 ```
 
 ## Development & Releases
